@@ -188,13 +188,13 @@ impl GlyphCache {
 
         let mut cache = GlyphCache {
             cache: HashMap::default(),
-            rasterizer: rasterizer,
+            rasterizer,
             font_size: font.size(),
             font_key: regular,
             bold_key: bold,
             italic_key: italic,
             glyph_offset: *font.glyph_offset(),
-            metrics: metrics
+            metrics,
         };
 
         cache.load_glyphs_for_font(regular, loader);
@@ -214,7 +214,7 @@ impl GlyphCache {
             self.get(&GlyphKey {
                 font_key: font,
                 c: i as char,
-                size: size
+                size,
             }, loader);
         }
     }
@@ -262,7 +262,7 @@ impl GlyphCache {
         let style = if let Some(ref spec) = desc.style {
             font::Style::Specific(spec.to_owned())
         } else {
-            font::Style::Description {slant:slant, weight:weight}
+            font::Style::Description { slant, weight }
         };
         FontDesc::new(&desc.family[..], style)
     }
@@ -295,7 +295,7 @@ impl GlyphCache {
     pub fn update_font_size<L: LoadGlyph>(
         &mut self,
         font: &config::Font,
-        delta: i8,
+        size: font::Size,
         loader: &mut L
     ) -> Result<(), font::Error> {
         // Clear currently cached data in both GL and the registry
@@ -303,8 +303,8 @@ impl GlyphCache {
         self.cache = HashMap::default();
 
         // Recompute font keys
-        let font = font.to_owned().with_size_delta(delta as _);
-        println!("{:?}", font.size);
+        let font = font.to_owned().with_size(size);
+        info!("Font size changed: {:?}", font.size);
         let (regular, bold, italic) = Self::compute_font_keys(&font, &mut self.rasterizer)?;
         self.rasterizer.get_glyph(&GlyphKey { font_key: regular, c: 'm', size: font.size() })?;
         let metrics = self.rasterizer.metrics(regular)?;
@@ -390,7 +390,7 @@ pub struct PackedVertex {
     y: f32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Batch {
     tex: GLuint,
     instances: Vec<InstanceData>,
@@ -428,13 +428,13 @@ impl Batch {
             uv_width: glyph.uv_width,
             uv_height: glyph.uv_height,
 
-            r: cell.fg.r as f32,
-            g: cell.fg.g as f32,
-            b: cell.fg.b as f32,
+            r: f32::from(cell.fg.r),
+            g: f32::from(cell.fg.g),
+            b: f32::from(cell.fg.b),
 
-            bg_r: cell.bg.r as f32,
-            bg_g: cell.bg.g as f32,
-            bg_b: cell.bg.b as f32,
+            bg_r: f32::from(cell.bg.r),
+            bg_g: f32::from(cell.bg.g),
+            bg_b: f32::from(cell.bg.b),
             bg_a: cell.bg_alpha,
         });
     }
@@ -471,7 +471,7 @@ impl Batch {
 }
 
 /// Maximum items to be drawn in a batch.
-const BATCH_MAX: usize = 65_536;
+const BATCH_MAX: usize = 0x1_0000;
 const ATLAS_SIZE: i32 = 1024;
 
 impl QuadRenderer {
@@ -606,11 +606,11 @@ impl QuadRenderer {
         }
 
         let mut renderer = QuadRenderer {
-            program: program,
-            vao: vao,
-            vbo: vbo,
-            ebo: ebo,
-            vbo_instance: vbo_instance,
+            program,
+            vao,
+            vbo,
+            ebo,
+            vbo_instance,
             atlas: Vec::new(),
             current_atlas: 0,
             active_tex: 0,
@@ -662,7 +662,7 @@ impl QuadRenderer {
             current_atlas: &mut self.current_atlas,
             program: &mut self.program,
             visual_bell_intensity: visual_bell_intensity as _,
-            config: config,
+            config,
         });
 
         unsafe {
@@ -739,9 +739,9 @@ impl<'a> RenderApi<'a> {
         let alpha = self.config.background_opacity().get();
         unsafe {
             gl::ClearColor(
-                (self.visual_bell_intensity + color.r as f32 / 255.0).min(1.0) * alpha,
-                (self.visual_bell_intensity + color.g as f32 / 255.0).min(1.0) * alpha,
-                (self.visual_bell_intensity + color.b as f32 / 255.0).min(1.0) * alpha,
+                (self.visual_bell_intensity + f32::from(color.r) / 255.0).min(1.0) * alpha,
+                (self.visual_bell_intensity + f32::from(color.g) / 255.0).min(1.0) * alpha,
+                (self.visual_bell_intensity + f32::from(color.b) / 255.0).min(1.0) * alpha,
                 alpha
                 );
             gl::Clear(gl::COLOR_BUFFER_BIT);
@@ -789,9 +789,9 @@ impl<'a> RenderApi<'a> {
         let cells = string.chars()
             .enumerate()
             .map(|(i, c)| RenderableCell {
-                line: line,
+                line,
                 column: col + i,
-                c: c,
+                c,
                 bg: color,
                 fg: Rgb { r: 0, g: 0, b: 0 },
                 flags: cell::Flags::empty(),
@@ -835,7 +835,7 @@ impl<'a> RenderApi<'a> {
             }
 
             let glyph_key = GlyphKey {
-                font_key: font_key,
+                font_key,
                 size: glyph_cache.font_size,
                 c: cell.c
             };
@@ -851,7 +851,7 @@ impl<'a> RenderApi<'a> {
             //       easy, clean hack.
             if cell.flags.contains(cell::Flags::UNDERLINE) {
                 let glyph_key = GlyphKey {
-                    font_key: font_key,
+                    font_key,
                     size: glyph_cache.font_size,
                     c: '_'
                 };
@@ -1089,7 +1089,7 @@ impl ShaderProgram {
             let mut success: GLint = 0;
             gl::GetProgramiv(program, gl::LINK_STATUS, &mut success);
 
-            if success == (gl::TRUE as GLint) {
+            if success == i32::from(gl::TRUE) {
                 Ok(program)
             } else {
                 Err(ShaderCreationError::Link(get_program_info_log(program)))
@@ -1125,7 +1125,7 @@ impl ShaderProgram {
             gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut success);
         }
 
-        if success == (gl::TRUE as GLint) {
+        if success == GLint::from(gl::TRUE) {
             Ok(shader)
         } else {
             // Read log
@@ -1332,7 +1332,7 @@ impl Atlas {
         }
 
         Atlas {
-            id: id,
+            id,
             width: size,
             height: size,
             row_extent: 0,
@@ -1348,11 +1348,11 @@ impl Atlas {
     }
 
     /// Insert a RasterizedGlyph into the texture atlas
-    pub fn insert(&mut self,
-                  glyph: &RasterizedGlyph,
-                  active_tex: &mut u32)
-                  -> Result<Glyph, AtlasInsertError>
-    {
+    pub fn insert(
+        &mut self,
+        glyph: &RasterizedGlyph,
+        active_tex: &mut u32
+    ) -> Result<Glyph, AtlasInsertError> {
         if glyph.width > self.width || glyph.height > self.height {
             return Err(AtlasInsertError::GlyphTooLarge);
         }
@@ -1376,11 +1376,7 @@ impl Atlas {
     /// Internal function for use once atlas has been checked for space. GL
     /// errors could still occur at this point if we were checking for them;
     /// hence, the Result.
-    fn insert_inner(&mut self,
-                    glyph: &RasterizedGlyph,
-                    active_tex: &mut u32)
-                    -> Glyph
-    {
+    fn insert_inner(&mut self, glyph: &RasterizedGlyph, active_tex: &mut u32) -> Glyph {
         let offset_y = self.row_baseline;
         let offset_x = self.row_extent;
         let height = glyph.height as i32;
@@ -1424,10 +1420,10 @@ impl Atlas {
             width: width as f32,
             height: height as f32,
             left: glyph.left as f32,
-            uv_bot: uv_bot,
-            uv_left: uv_left,
-            uv_width: uv_width,
-            uv_height: uv_height,
+            uv_bot,
+            uv_left,
+            uv_width,
+            uv_height,
         }
     }
 

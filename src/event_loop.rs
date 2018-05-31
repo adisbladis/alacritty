@@ -90,9 +90,8 @@ impl event::Notify for Notifier {
         if bytes.len() == 0 {
             return
         }
-        match self.0.send(Msg::Input(bytes)) {
-            Ok(_) => (),
-            Err(_) => panic!("expected send event loop msg"),
+        if self.0.send(Msg::Input(bytes)).is_err() {
+            panic!("expected send event loop msg");
         }
     }
 }
@@ -180,12 +179,12 @@ impl<Io> EventLoop<Io>
         let (tx, rx) = channel::channel();
         EventLoop {
             poll: mio::Poll::new().expect("create mio Poll"),
-            pty: pty,
-            tx: tx,
-            rx: rx,
-            terminal: terminal,
-            display: display,
-            ref_test: ref_test,
+            pty,
+            tx,
+            rx,
+            terminal,
+            display,
+            ref_test,
         }
     }
 
@@ -252,9 +251,12 @@ impl<Io> EventLoop<Io>
     ) -> io::Result<()>
         where W: Write
     {
-        const MAX_READ: usize = 65_536;
+        const MAX_READ: usize = 0x1_0000;
         let mut processed = 0;
         let mut terminal = None;
+
+        // Flag to keep track if wakeup has already been sent
+        let mut send_wakeup = false;
 
         loop {
             match self.pty.read(&mut buf[..]) {
@@ -273,10 +275,14 @@ impl<Io> EventLoop<Io>
                     // Get reference to terminal. Lock is acquired on initial
                     // iteration and held until there's no bytes left to parse
                     // or we've reached MAX_READ.
-                    if terminal.is_none() {
+                    let terminal = if terminal.is_none() {
                         terminal = Some(self.terminal.lock());
-                    }
-                    let terminal = terminal.as_mut().unwrap();
+                        let terminal = terminal.as_mut().unwrap();
+                        send_wakeup = !terminal.dirty;
+                        terminal
+                    } else {
+                        terminal.as_mut().unwrap()
+                    };
 
                     // Run the parser
                     for byte in &buf[..got] {
@@ -302,7 +308,7 @@ impl<Io> EventLoop<Io>
 
         // Only request a draw if one hasn't already been requested.
         if let Some(mut terminal) = terminal {
-            if !terminal.dirty {
+            if send_wakeup {
                 self.display.notify();
                 terminal.dirty = true;
             }
@@ -351,7 +357,7 @@ impl<Io> EventLoop<Io>
     ) -> thread::JoinHandle<(EventLoop<Io>, State)> {
         thread::spawn_named("pty reader", move || {
             let mut state = state.unwrap_or_else(Default::default);
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 0x1000];
 
             let fd = self.pty.as_raw_fd();
             let fd = EventedFd(&fd);

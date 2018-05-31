@@ -25,10 +25,10 @@ use std::time::Instant;
 use std::os::unix::process::CommandExt;
 
 use copypasta::{Clipboard, Load, Buffer};
-use glutin::{ElementState, VirtualKeyCode, MouseButton, TouchPhase, MouseScrollDelta};
-use glutin::ModifiersState;
+use glutin::{ElementState, VirtualKeyCode, MouseButton, TouchPhase, MouseScrollDelta, ModifiersState};
 
 use config;
+use grid::Scroll;
 use event::{ClickState, Mouse};
 use index::{Line, Column, Side, Point};
 use term::SizeInfo;
@@ -45,6 +45,7 @@ pub struct Processor<'a, A: 'a> {
     pub key_bindings: &'a [KeyBinding],
     pub mouse_bindings: &'a [MouseBinding],
     pub mouse_config: &'a config::Mouse,
+    pub scrolling_config: &'a config::Scrolling,
     pub ctx: A,
 }
 
@@ -65,6 +66,7 @@ pub trait ActionContext {
     fn last_modifiers(&mut self) -> &mut ModifiersState;
     fn change_font_size(&mut self, delta: i8);
     fn reset_font_size(&mut self);
+    fn scroll(&mut self, scroll: Scroll);
 }
 
 /// Describes a state and action to take in that state
@@ -166,6 +168,18 @@ pub enum Action {
     /// Reset font size to the config value
     ResetFontSize,
 
+    /// Scroll exactly one page up
+    ScrollPageUp,
+
+    /// Scroll exactly one page down
+    ScrollPageDown,
+
+    /// Scroll all the way to the top
+    ScrollToTop,
+
+    /// Scroll all the way to the bottom
+    ScrollToBottom,
+
     /// Run given command
     Command(String, Vec<String>),
 
@@ -178,6 +192,7 @@ impl Action {
     fn execute<A: ActionContext>(&self, ctx: &mut A) {
         match *self {
             Action::Esc(ref s) => {
+                ctx.scroll(Scroll::Bottom);
                 ctx.write_to_pty(s.clone().into_bytes())
             },
             Action::Copy => {
@@ -231,7 +246,19 @@ impl Action {
             }
             Action::ResetFontSize => {
                ctx.reset_font_size();
-            }
+            },
+            Action::ScrollPageUp => {
+                ctx.scroll(Scroll::PageUp);
+            },
+            Action::ScrollPageDown => {
+                ctx.scroll(Scroll::PageDown);
+            },
+            Action::ScrollToTop => {
+                ctx.scroll(Scroll::Top);
+            },
+            Action::ScrollToBottom => {
+                ctx.scroll(Scroll::Bottom);
+            },
         }
     }
 
@@ -241,7 +268,13 @@ impl Action {
             ctx.write_to_pty(contents.into_bytes());
             ctx.write_to_pty(&b"\x1b[201~"[..]);
         } else {
-            ctx.write_to_pty(contents.into_bytes());
+            // In non-bracketed (ie: normal) mode, terminal applications cannot distinguish
+            // pasted data from keystrokes.
+            // In theory, we should construct the keystrokes needed to produce the data we are
+            // pasting... since that's neither practical nor sensible (and probably an impossible
+            // task to solve in a general way), we'll just replace line breaks (windows and unix
+            // style) with a singe carriage return (\r, which is what the Enter key produces).
+            ctx.write_to_pty(contents.replace("\r\n","\r").replace("\n","\r").into_bytes());
         }
     }
 }
@@ -254,40 +287,43 @@ impl From<&'static str> for Action {
 
 impl<'a, A: ActionContext + 'a> Processor<'a, A> {
     #[inline]
-    pub fn mouse_moved(&mut self, x: u32, y: u32) {
+    pub fn mouse_moved(&mut self, x: usize, y: usize, modifiers: ModifiersState) {
         self.ctx.mouse_mut().x = x;
         self.ctx.mouse_mut().y = y;
 
         let size_info = self.ctx.size_info();
-        if let Some(point) = size_info.pixels_to_coords(x as usize, y as usize) {
-            let prev_line = mem::replace(&mut self.ctx.mouse_mut().line, point.line);
-            let prev_col = mem::replace(&mut self.ctx.mouse_mut().column, point.col);
+        let point = size_info.pixels_to_coords(x, y);
 
-            let cell_x = (x as usize - size_info.padding_x as usize) % size_info.cell_width as usize;
-            let half_cell_width = (size_info.cell_width / 2.0) as usize;
+        let prev_line = mem::replace(&mut self.ctx.mouse_mut().line, point.line);
+        let prev_col = mem::replace(&mut self.ctx.mouse_mut().column, point.col);
 
-            let cell_side = if cell_x > half_cell_width {
-                Side::Right
-            } else {
-                Side::Left
-            };
-            self.ctx.mouse_mut().cell_side = cell_side;
+        let cell_x = x.saturating_sub(size_info.padding_x as usize) % size_info.cell_width as usize;
+        let half_cell_width = (size_info.cell_width / 2.0) as usize;
 
-            if self.ctx.mouse_mut().left_button_state == ElementState::Pressed {
-                let report_mode = mode::TermMode::MOUSE_REPORT_CLICK | mode::TermMode::MOUSE_MOTION;
-                if !self.ctx.terminal_mode().intersects(report_mode) {
-                    self.ctx.update_selection(Point {
-                        line: point.line,
-                        col: point.col
-                    }, cell_side);
-                } else if self.ctx.terminal_mode().contains(mode::TermMode::MOUSE_MOTION)
-                        // Only report motion when changing cells
-                        && (
-                            prev_line != self.ctx.mouse_mut().line
-                            || prev_col != self.ctx.mouse_mut().column
-                        ) {
-                        self.mouse_report(32);
-                }
+        let cell_side = if cell_x > half_cell_width
+            // Edge case when mouse leaves the window
+            || x as f32 >= size_info.width - size_info.padding_x
+        {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        self.ctx.mouse_mut().cell_side = cell_side;
+
+        if self.ctx.mouse_mut().left_button_state == ElementState::Pressed {
+            let report_mode = mode::TermMode::MOUSE_REPORT_CLICK | mode::TermMode::MOUSE_MOTION;
+            if modifiers.shift || !self.ctx.terminal_mode().intersects(report_mode) {
+                self.ctx.update_selection(Point {
+                    line: point.line,
+                    col: point.col
+                }, cell_side);
+            } else if self.ctx.terminal_mode().contains(mode::TermMode::MOUSE_MOTION)
+                // Only report motion when changing cells
+                && (prev_line != self.ctx.mouse_mut().line
+                    || prev_col != self.ctx.mouse_mut().column)
+                && size_info.contains_point(x, y)
+            {
+                self.mouse_report(32, ElementState::Pressed);
             }
         }
     }
@@ -309,18 +345,20 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
         }
     }
 
-    pub fn sgr_mouse_report(&mut self, button: u8, release: bool) {
+    pub fn sgr_mouse_report(&mut self, button: u8, state: ElementState) {
         let (line, column) = (self.ctx.mouse_mut().line, self.ctx.mouse_mut().column);
-        let c = if release { 'm' } else { 'M' };
+        let c = match state {
+            ElementState::Pressed => 'M',
+            ElementState::Released => 'm',
+        };
 
         let msg = format!("\x1b[<{};{};{}{}", button, column + 1, line + 1, c);
         self.ctx.write_to_pty(msg.into_bytes());
     }
 
-    pub fn mouse_report(&mut self, button: u8) {
+    pub fn mouse_report(&mut self, button: u8, state: ElementState) {
         if self.ctx.terminal_mode().contains(mode::TermMode::SGR_MOUSE) {
-            let release = self.ctx.mouse_mut().left_button_state != ElementState::Pressed;
-            self.sgr_mouse_report(button, release);
+            self.sgr_mouse_report(button, state);
         } else {
             self.normal_mouse_report(button);
         }
@@ -338,7 +376,7 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
         }
     }
 
-    pub fn on_mouse_press(&mut self) {
+    pub fn on_mouse_press(&mut self, modifiers: ModifiersState) {
         let now = Instant::now();
         let elapsed = self.ctx.mouse_mut().last_click_timestamp.elapsed();
         self.ctx.mouse_mut().last_click_timestamp = now;
@@ -353,34 +391,31 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
                 ClickState::TripleClick
             },
             _ => {
+                self.ctx.clear_selection();
                 let report_modes = mode::TermMode::MOUSE_REPORT_CLICK | mode::TermMode::MOUSE_MOTION;
-                if self.ctx.terminal_mode().intersects(report_modes) {
-                    self.mouse_report(0);
+                if !modifiers.shift && self.ctx.terminal_mode().intersects(report_modes) {
+                    self.mouse_report(0, ElementState::Pressed);
                     return;
                 }
 
-                self.ctx.clear_selection();
                 ClickState::Click
             }
         };
     }
 
-    pub fn on_mouse_release(&mut self) {
-        if self.ctx.terminal_mode().intersects(mode::TermMode::MOUSE_REPORT_CLICK | mode::TermMode::MOUSE_MOTION) {
-            self.mouse_report(3);
+    pub fn on_mouse_release(&mut self, modifiers: ModifiersState) {
+        let report_modes = mode::TermMode::MOUSE_REPORT_CLICK | mode::TermMode::MOUSE_MOTION;
+        if !modifiers.shift && self.ctx.terminal_mode().intersects(report_modes)
+        {
+            self.mouse_report(3, ElementState::Released);
             return;
         }
 
         self.ctx.copy_selection(Buffer::Selection);
     }
 
-    pub fn on_mouse_wheel(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
-        let modes = mode::TermMode::MOUSE_REPORT_CLICK | mode::TermMode::MOUSE_MOTION | mode::TermMode::SGR_MOUSE |
-            mode::TermMode::ALT_SCREEN;
-        if !self.ctx.terminal_mode().intersects(modes) {
-            return;
-        }
-
+    pub fn on_mouse_wheel(&mut self, delta: MouseScrollDelta, phase: TouchPhase, modifiers: ModifiersState) {
+        let mouse_modes = mode::TermMode::MOUSE_REPORT_CLICK | mode::TermMode::MOUSE_MOTION | mode::TermMode::SGR_MOUSE;
         match delta {
             MouseScrollDelta::LineDelta(_columns, lines) => {
                 let to_scroll = self.ctx.mouse_mut().lines_scrolled + lines;
@@ -390,19 +425,9 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
                     65
                 };
 
+                let scrolling_multiplier = self.scrolling_config.multiplier;
                 for _ in 0..(to_scroll.abs() as usize) {
-                    if self.ctx.terminal_mode().intersects(mode::TermMode::ALT_SCREEN) {
-                        // Faux scrolling
-                        if code == 64 {
-                            // Scroll up one line
-                            self.ctx.write_to_pty("\x1bOA".as_bytes());
-                        } else {
-                            // Scroll down one line
-                            self.ctx.write_to_pty("\x1bOB".as_bytes());
-                        }
-                    } else {
-                        self.normal_mouse_report(code);
-                    }
+                    self.scroll_terminal(mouse_modes, code, modifiers, scrolling_multiplier)
                 }
 
                 self.ctx.mouse_mut().lines_scrolled = to_scroll % 1.0;
@@ -418,7 +443,7 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
                         let height = self.ctx.size_info().cell_height as i32;
 
                         while self.ctx.mouse_mut().scroll_px.abs() >= height {
-                            let button = if self.ctx.mouse_mut().scroll_px > 0 {
+                            let code = if self.ctx.mouse_mut().scroll_px > 0 {
                                 self.ctx.mouse_mut().scroll_px -= height;
                                 64
                             } else {
@@ -426,22 +451,40 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
                                 65
                             };
 
-                            if self.ctx.terminal_mode().intersects(mode::TermMode::ALT_SCREEN) {
-                                // Faux scrolling
-                                if button == 64 {
-                                    // Scroll up one line
-                                    self.ctx.write_to_pty("\x1bOA".as_bytes());
-                                } else {
-                                    // Scroll down one line
-                                    self.ctx.write_to_pty("\x1bOB".as_bytes());
-                                }
-                            } else {
-                                self.normal_mouse_report(button);
-                            }
+                            self.scroll_terminal(mouse_modes, code, modifiers, 1)
                         }
                     },
                     _ => (),
                 }
+            }
+        }
+    }
+
+    fn scroll_terminal(&mut self, mouse_modes: TermMode, code: u8, modifiers: ModifiersState, scroll_multiplier: u8) {
+        debug_assert!(code == 64 || code == 65);
+
+        // Make sure the new and deprecated setting are both allowed
+        let faux_scrollback_lines = self.mouse_config
+            .faux_scrollback_lines
+            .unwrap_or(self.scrolling_config.faux_multiplier as usize);
+
+        if self.ctx.terminal_mode().intersects(mouse_modes) {
+            self.mouse_report(code, ElementState::Pressed);
+        } else if self.ctx.terminal_mode().contains(TermMode::ALT_SCREEN)
+            && faux_scrollback_lines > 0 && !modifiers.shift
+        {
+            // Faux scrolling
+            let cmd = code + 1; // 64 + 1 = A, 65 + 1 = B
+            let mut content = Vec::with_capacity(faux_scrollback_lines * 3);
+            for _ in 0..faux_scrollback_lines {
+                content.push(0x1b);
+                content.push(b'O');
+                content.push(cmd);
+            }
+            self.ctx.write_to_pty(content);
+        } else {
+            for _ in 0..scroll_multiplier {
+                self.ctx.scroll(Scroll::Lines(-((code as isize) * 2 - 129)));
             }
         }
     }
@@ -459,16 +502,16 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
         }
     }
 
-    pub fn mouse_input(&mut self, state: ElementState, button: MouseButton) {
+    pub fn mouse_input(&mut self, state: ElementState, button: MouseButton, modifiers: ModifiersState) {
         if let MouseButton::Left = button {
             let state = mem::replace(&mut self.ctx.mouse_mut().left_button_state, state);
             if self.ctx.mouse_mut().left_button_state != state {
                 match self.ctx.mouse_mut().left_button_state {
                     ElementState::Pressed => {
-                        self.on_mouse_press();
+                        self.on_mouse_press(modifiers);
                     },
                     ElementState::Released => {
-                        self.on_mouse_release();
+                        self.on_mouse_release(modifiers);
                     }
                 }
             }
@@ -508,6 +551,7 @@ impl<'a, A: ActionContext + 'a> Processor<'a, A> {
     /// Process a received character
     pub fn received_char(&mut self, c: char) {
         if !*self.ctx.suppress_chars() {
+            self.ctx.scroll(Scroll::Bottom);
             self.ctx.clear_selection();
 
             let utf8_len = c.len_utf8();
@@ -576,6 +620,7 @@ mod tests {
     use config::{self, Config, ClickHandler};
     use index::{Point, Side};
     use selection::Selection;
+    use grid::Scroll;
 
     use super::{Action, Binding, Processor};
 
@@ -627,6 +672,10 @@ mod tests {
 
         fn line_selection(&mut self, _point: Point) {
             self.last_action = MultiClick::TripleClick;
+        }
+
+        fn scroll(&mut self, scroll: Scroll) {
+            self.terminal.scroll_display(scroll);
         }
 
         fn mouse_coords(&self) -> Option<Point> {
@@ -698,14 +747,16 @@ mod tests {
                         },
                         triple_click: ClickHandler {
                             threshold: Duration::from_millis(1000),
-                        }
+                        },
+                        faux_scrollback_lines: None,
                     },
+                    scrolling_config: &config::Scrolling::default(),
                     key_bindings: &config.key_bindings()[..],
                     mouse_bindings: &config.mouse_bindings()[..],
                 };
 
-                if let Event::WindowEvent { event: WindowEvent::MouseInput { state, button, .. }, .. } = $input {
-                    processor.mouse_input(state, button);
+                if let Event::WindowEvent { event: WindowEvent::MouseInput { state, button, modifiers, .. }, .. } = $input {
+                    processor.mouse_input(state, button, modifiers);
                 };
 
                 assert!(match mouse.click_state {
@@ -743,6 +794,7 @@ mod tests {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 device_id: unsafe { ::std::mem::transmute_copy(&0) },
+                modifiers: ModifiersState::default(),
             },
             window_id: unsafe { ::std::mem::transmute_copy(&0) },
         },
@@ -758,6 +810,7 @@ mod tests {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 device_id: unsafe { ::std::mem::transmute_copy(&0) },
+                modifiers: ModifiersState::default(),
             },
             window_id: unsafe { ::std::mem::transmute_copy(&0) },
         },
@@ -773,6 +826,7 @@ mod tests {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 device_id: unsafe { ::std::mem::transmute_copy(&0) },
+                modifiers: ModifiersState::default(),
             },
             window_id: unsafe { ::std::mem::transmute_copy(&0) },
         },
